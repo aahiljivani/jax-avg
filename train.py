@@ -6,6 +6,7 @@ import flax.struct
 from flax.training.train_state import TrainState
 from brax.training.acme import running_statistics, specs
 from brax import envs
+from brax.envs.base import Wrapper
 from brax.envs.wrappers.training import wrap
 from td_error_scalar import TDErrorScaler, init_td_error_scaler
 from model_utils import init_actor, init_Q, Transition, critic_update, actor_update
@@ -27,24 +28,46 @@ def init_obs_normalizer(obs_dim):
     return running_statistics.init_state(specs.Array((obs_dim,), jnp.float32))
 
 
+LAST_STEP = "last_step"
+
+
+class KeepLastStep(Wrapper):
+    """Goes under the auto-reset wrapper, which replaces obs with the reset obs when an episode ends.
+    Saves the real next obs and whether the episode terminated (hitting the time limit is not termination)."""
+
+    def reset(self, rng):
+        state = self.env.reset(rng)
+        state.info[LAST_STEP] = {"next_obs": state.obs, "terminated": jnp.zeros_like(state.done)}
+        return state
+
+    def step(self, state, action):
+        state = self.env.step(state, action)
+        state.info[LAST_STEP] = {
+            "next_obs": state.obs, "terminated": state.done * (1 - state.info["truncation"])}
+        return state
+
+
 def AVG(cfg, env):
     rng = jax.random.PRNGKey(cfg.seed)
     rng, actor_key, critic_key = jax.random.split(rng, 3)
     obs_dim = env.observation_size
     action_dim = env.action_size
     num_envs = cfg.num_envs
-    net_params = {"mlp": [cfg.nhid_actor, cfg.nhid_actor]}
+    actor_net = {"mlp": [cfg.nhid_actor, cfg.nhid_actor]}
+    critic_net = {"mlp": [cfg.nhid_critic, cfg.nhid_critic]}
     layer_norm = False
     dtype = jnp.float32
     scaler = init_td_error_scaler()
     scaler = jax.tree.map(lambda x: jnp.broadcast_to(x, (num_envs,) + x.shape), scaler)
-    _,actor = init_actor(actor_key, cfg.actor_lr, obs_dim, net_params, action_dim, layer_norm, dtype)
-    _,critic = init_Q(critic_key, cfg.critic_lr, obs_dim, net_params, action_dim, layer_norm, dtype)
+    _,actor = init_actor(actor_key, cfg.actor_lr, obs_dim, actor_net, action_dim, layer_norm, dtype, cfg.beta1)
+    _,critic = init_Q(critic_key, cfg.critic_lr, obs_dim, critic_net, action_dim, layer_norm, dtype, cfg.beta1)
     return AVGState(
         actor=actor,
         critic=critic,
         td_error_scaler=scaler,
-        normalizer=init_obs_normalizer(obs_dim),
+        # start from one all-zero obs: with an empty normalizer and 1 env the first obs normalizes to
+        # exactly 0, and the actor's phi / norm(phi) is then 0/0 = nan
+        normalizer=running_statistics.update(init_obs_normalizer(obs_dim), jnp.zeros((1, obs_dim))),
         rng=rng,
         steps=jnp.zeros((), jnp.int32),
     )
@@ -73,12 +96,14 @@ def make_step(env, alpha, gamma, warm_start):
             agent.actor, agent.actor.params, keys, obs_n)
         env_state = env.step(env_state, action)
         # normalize next obs
-        next_n = running_statistics.normalize(env_state.obs, normalizer)
+        # env_state.obs is already the reset obs when the episode ended, and env_state.done is also set at the time limit
+        last = env_state.info[LAST_STEP]
+        next_n = running_statistics.normalize(last["next_obs"], normalizer)
         batch = Transition(
             obs=obs_n,
             action=action,
             reward=env_state.reward,
-            done=env_state.done,
+            done=last["terminated"],
             next_obs=next_n,
             lprob=lprob,
             sample_key=keys,
@@ -123,13 +148,18 @@ def make_step(env, alpha, gamma, warm_start):
 def train(cfg, agent, env):
     num_envs = cfg.num_envs
     run = wandb_run(cfg) if cfg.wandb else None
+    env.env = KeepLastStep(env.env)  # env is the auto-reset wrapper; slot in right under it
     keys = jax.random.split(jax.random.PRNGKey(cfg.seed), num_envs)
     env_state = env.reset(keys)
     ep_ret = jnp.zeros((num_envs,))
     step = make_step(env, cfg.alpha_lr, cfg.gamma, cfg.warm_start_critic)
     # training loop
+    ploss_sum, qloss_sum, n = 0.0, 0.0, 0  # for the mean loss since the last finished episode
     for _ in range(cfg.N // num_envs):
         agent, env_state, ep_ret, finished_ret, metrics = step(agent, env_state, ep_ret)
+        ploss_sum += float(metrics["ploss"])
+        qloss_sum += float(metrics["qloss"])
+        n += 1
         if run is not None and bool(jnp.any(env_state.done)):
             done = jnp.asarray(env_state.done)
             for i in range(num_envs):
@@ -138,11 +168,12 @@ def train(cfg, agent, env):
                         {
                             "timesteps": float(metrics["timesteps"]),
                             "episode_return": float(finished_ret[i]),
-                            "ploss": float(metrics["ploss"]),
-                            "qloss": float(metrics["qloss"]),
+                            "ploss": ploss_sum / n,
+                            "qloss": qloss_sum / n,
                         },
                         run,
                     )
+            ploss_sum, qloss_sum, n = 0.0, 0.0, 0
     return agent
 
 if __name__ == "__main__":
@@ -173,7 +204,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # create env
-    env = wrap(envs.create(env_name=args.env), episode_length=args.episode_length)
+    # get_environment, not envs.create: create already adds its own episode and auto-reset wrappers,
+    # and wrapped twice the step counter advances by 2, so the time limit hit at episode_length / 2
+    env = wrap(envs.get_environment(args.env), episode_length=args.episode_length)
     # create agent
     agent = AVG(args, env)
     # train agent

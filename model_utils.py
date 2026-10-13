@@ -32,13 +32,14 @@ net_params,
 action_dim,
 layer_norm,
 dtype,
+b1,
 ):
     q = Q(net_params, obs_dim, action_dim, layer_norm, dtype)
     init_actions = jnp.zeros((1, action_dim))
     init_obs = jnp.zeros((1, obs_dim))
     rng, init_key, sample_key = random.split(rng, 3)
     params = q.init(init_key, sample_key, init_obs, init_actions)['params']
-    tx=optax.adam(lr, b1=0.0, mu_dtype=dtype) # zero nans and clip by global norm? JSAC reference
+    tx=optax.adam(lr, b1=b1, mu_dtype=dtype) # zero nans and clip by global norm? JSAC reference
     return rng, TrainState.create(apply_fn=q.apply, params=params, tx=tx)
 
 def init_actor(rng,
@@ -48,12 +49,13 @@ net_params,
 action_dim,
 layer_norm,
 dtype,
+b1,
 ):
     actor = Actor(net_params, action_dim, layer_norm, dtype)
     init_obs = jnp.zeros((1, obs_dim))
     rng, init_key, sample_key = random.split(rng, 3)
     params = actor.init(init_key, sample_key, init_obs)['params']
-    tx=optax.adam(lr, b1=0.0, mu_dtype=dtype) # zero nans and clip by global norm? JSAC reference
+    tx=optax.adam(lr, b1=b1, mu_dtype=dtype) # zero nans and clip by global norm? JSAC reference
     return rng, TrainState.create(apply_fn=actor.apply, params=params, tx=tx)
 
 
