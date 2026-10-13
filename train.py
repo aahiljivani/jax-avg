@@ -1,203 +1,180 @@
-import torch, time, pickle
-import argparse, os, traceback
+import argparse
+from pathlib import Path
 import jax
-import numpy as np
-import torch.nn as nn
-import gymnasium as gym
-import torch.nn.functional as F
+import jax.numpy as jnp
+import flax.struct
+from flax.training.train_state import TrainState
+from brax.training.acme import running_statistics, specs
+from brax import envs
+from brax.envs.wrappers.training import wrap
+from td_error_scalar import TDErrorScaler, init_td_error_scaler
+from model_utils import init_actor, init_Q, Transition, critic_update, actor_update
+from utils import wandb_run, log_fn, save_avg_checkpoint
 
-from gymnasium.wrappers import NormalizeObservation, ClipAction
-from datetime import datetime
-from sim2sim.avg.experiment_tracker import record_video
-from sim2sim.avg.jax.td_error_scalar import TDErrorScaler
-from sim2sim.avg.jax.model_utils import init_actor, init_Q
-from sim2sim.avg.jax.td_error_scalar import init_td_error_scaler
+@flax.struct.dataclass
+class AVGState:
+    actor: TrainState
+    critic: TrainState
+    td_error_scaler: TDErrorScaler
+    normalizer: running_statistics.RunningStatisticsState
+    rng: jnp.ndarray
+    steps: jnp.ndarray
 
 
-def human_format_numbers(num, use_float=False):
-    # Make human readable short-forms for large numbers
-    magnitude = 0
-    while abs(num) >= 1000:
-        magnitude += 1
-        num /= 1000.0
-    # add more suffixes if you need them
-    if use_float:
-        return '%.2f%s' % (num, ['', 'K', 'M', 'G', 'T', 'P'][magnitude])
-    return '%d%s' % (num, ['', 'K', 'M', 'G', 'T', 'P'][magnitude])
 
-def set_one_thread():
+def init_obs_normalizer(obs_dim):
+    ''' observation normalizer'''
+    return running_statistics.init_state(specs.Array((obs_dim,), jnp.float32))
+
+
+def AVG(cfg, env):
+    rng = jax.random.PRNGKey(cfg.seed)
+    rng, actor_key, critic_key = jax.random.split(rng, 3)
+    obs_dim = env.observation_size
+    action_dim = env.action_size
+    num_envs = cfg.num_envs
+    net_params = {"mlp": [cfg.nhid_actor, cfg.nhid_actor]}
+    layer_norm = False
+    dtype = jnp.float32
+    scaler = init_td_error_scaler()
+    scaler = jax.tree.map(lambda x: jnp.broadcast_to(x, (num_envs,) + x.shape), scaler)
+    return AVGState(
+        actor=init_actor(actor_key, cfg.actor_lr, obs_dim, net_params, action_dim, layer_norm, dtype),
+        critic=init_Q(critic_key, cfg.critic_lr, obs_dim, net_params, action_dim, layer_norm, dtype),
+        td_error_scaler=scaler,
+        normalizer=init_obs_normalizer(obs_dim),
+        rng=rng,
+        steps=jnp.zeros((), jnp.int32),
+    )
+
+
+def sample_action(actor, params, key, obs_i):
+    ''' sample action from actor, return action and log probability'''
+    action, info = actor.apply_fn({"params": params}, key, obs_i, temperature=1.0)
+    return action, info["lprob"]
+
+
+def make_step(env, alpha, gamma, warm_start):
+    ''' 
+    step consists of normalizing obs, sampling action, 
+    env step, and updating both critic and actor.
     '''
-    N.B: Pytorch over-allocates resources and hogs CPU, which makes experiments very slow!
-    Set number of threads for pytorch to 1 to avoid this issue. This is a temporary workaround.
-    '''
-    os.environ['OMP_NUM_THREADS'] = '1'
-    os.environ['MKL_NUM_THREADS'] = '1'
-    torch.set_num_threads(1)
+    def step(agent, env_state, ep_ret):
+        rng, act_key, upd_key = jax.random.split(agent.rng, 3)
+        num_envs = env_state.obs.shape[0]
+        keys = jax.random.split(act_key, num_envs)
+        # obs normalization happens here, update statistics, normalize obs
+        normalizer = running_statistics.update(agent.normalizer, env_state.obs)
+        obs_n = running_statistics.normalize(env_state.obs, normalizer)
+        # sample action
+        action, lprob = jax.vmap(sample_action, in_axes=(None, None, 0, 0))(
+            agent.actor, agent.actor.params, keys, obs_n)
+        env_state = env.step(env_state, action)
+        next_n = running_statistics.normalize(env_state.obs, normalizer)
+        batch = Transition(
+            obs=obs_n,
+            action=action,
+            reward=env_state.reward,
+            done=env_state.done,
+            next_obs=next_n,
+            lprob=lprob,
+            sample_key=keys,
+        )
 
-class AVG:
-    def __init__(self, cfg):
-        self.cfg = cfg
-        self.steps = 0  
-        # model initializations and parameter initialization
-        self.actor = init_actor(net_params=cfg.net_params, action_dim=cfg.action_dim, layer_norm=cfg.layer_norm, dtype=cfg.dtype)
-        self.Q = init_Q(net_params=cfg.net_params, obs_dim=cfg.obs_dim, action_dim=cfg.action_dim, layer_norm=cfg.layer_norm, dtype=cfg.dtype)
-        self.td_error_scaler = init_td_error_scaler()
-        self.alpha, self.gamma = cfg.alpha_lr, cfg.gamma
-        self.G = 0
-        self.rng = jax.random.PRNGKey(cfg.seed)
+        scaler, qloss_fn = critic_update(
+            upd_key, agent.actor, agent.critic, 1.0, batch, gamma, agent.td_error_scaler, alpha)
+        qloss, qgrads = jax.value_and_grad(qloss_fn)(agent.critic.params)
+        rng, agrads, ploss = actor_update(rng, agent.critic, batch, agent.actor, alpha)
+        critic = agent.critic.apply_gradients(grads=qgrads)
+        actor = jax.lax.cond(
+            agent.steps >= warm_start,
+            lambda a: a.apply_gradients(grads=agrads),
+            lambda a: a,
+            agent.actor,
+        )
+        ploss = jnp.where(agent.steps >= warm_start, ploss, 0.0)
 
-    def compute_action(self, obs):
-        rng, key = jax.random.split(self.rng)
-        action, action_info = self.actor.apply_fn(self.actor.params, key, obs)
-        return action, action_info  
+        ep_ret = ep_ret + env_state.reward
+        finished_ret = ep_ret
+        ep_ret = jnp.where(env_state.done, jnp.zeros_like(ep_ret), ep_ret)
 
-    def update(self, obs, action, next_obs, reward, done, **kwargs):
-        # TODO: Implement the update step with warm start critic and actor updates.
-        if self.cfg.warm_start_critic is not None and self.steps <= self.cfg.warm_start_critic:
-            ploss = torch.zeros((), device=self.device)
-        else:
-            ploss = self.alpha * lprob - self.Q(obs, action) # N.B: USE reparametrized action
-            self.popt.zero_grad()
-            ploss.backward()
-            self.popt.step()
+        agent = agent.replace(
+            actor=actor,
+            critic=critic,
+            td_error_scaler=scaler,
+            normalizer=normalizer,
+            rng=rng,
+            steps=agent.steps + num_envs,
+        )
+        metrics = {"ploss": ploss, "qloss": qloss, "timesteps": agent.steps}
+        return agent, env_state, ep_ret, finished_ret, metrics
 
-        self.qopt.zero_grad()
-        qloss.backward()
-        self.qopt.step()
-
-        return ploss.item(), qloss.item()   
-
-
-    def save(self, model_dir, unique_str):
-        model = {
-            "actor": self.actor.state_dict(),
-            "critic": self.Q.state_dict(),
-            "policy_opt": self.popt.state_dict(),
-            "critic_opt": self.qopt.state_dict(),
-        }
-        torch.save(model, '%s/%s.pt' % (model_dir, unique_str))
-    
-class SqueezeVecEnv(gym.Env):
-    def __init__(self, vec, seed=0):
-        self.vec = vec
-        self.observation_space = vec.single_observation_space
-        self.action_space = vec.single_action_space
-
-    def reset(self, *, seed=None, options=None):
-        # Fixed start pose: vec.reset(seed=None) reuses the key from the last seeded reset.
-        obs, info = self.vec.reset(seed=seed)
-        return obs[0], info
-
-    def step(self, action):
-        obs, r, term, trunc, info = self.vec.step(np.asarray(action, np.float32)[None])
-        if (term[0] or trunc[0]) and info.get("_final_observation", [False])[0]:
-            obs = info["final_observation"]                             
-        return obs[0], float(r[0]), bool(term[0]), bool(trunc[0]), info
+    return jax.jit(step)
 
 
+def train(cfg, agent, env):
+    num_envs = cfg.num_envs
+    run = wandb_run(cfg) if cfg.wandb else None
+    keys = jax.random.split(jax.random.PRNGKey(cfg.seed), num_envs)
+    env_state = env.reset(keys)
+    ep_ret = jnp.zeros((num_envs,))
+    step = make_step(env, cfg.alpha_lr, cfg.gamma, cfg.warm_start_critic)
+    # training loop
+    for _ in range(cfg.N // num_envs):
+        agent, env_state, ep_ret, finished_ret, metrics = step(agent, env_state, ep_ret)
+        if run is not None and bool(jnp.any(env_state.done)):
+            done = jnp.asarray(env_state.done)
+            for i in range(num_envs):
+                if bool(done[i]):
+                    log_fn(
+                        {
+                            "timesteps": float(metrics["timesteps"]),
+                            "episode_return": float(finished_ret[i]),
+                            "ploss": float(metrics["ploss"]),
+                            "qloss": float(metrics["qloss"]),
+                        },
+                        run,
+                    )
+    return agent
 
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--env', default="walker2d", type=str, help="e.g., 'walker2d' check brax documentation")
+    parser.add_argument('--seed', default=42, type=int, help="Seed for random number generator")       
+    parser.add_argument('--N', default=10001000, type=int, help="# timesteps for the run")
+    # SAVG params
+    parser.add_argument('--actor_lr', default=0.0063, type=float, help="Actor step size")
+    parser.add_argument('--critic_lr', default=0.0087, type=float, help="Critic step size")
+    parser.add_argument('--beta1', default=0., type=float, help="Beta1 parameter of Adam optimizer")
+    parser.add_argument('--gamma', default=0.99, type=float, help="Discount factor")
+    parser.add_argument('--alpha_lr', default=0.07, type=float, help="Entropy Coefficient for AVG")
+    parser.add_argument('--l2_actor', default=0, type=float, help="L2 Regularization")
+    parser.add_argument('--l2_critic', default=0, type=float, help="L2 Regularization")    
+    parser.add_argument('--nhid_actor', default=256, type=int)
+    parser.add_argument('--nhid_critic', default=256, type=int)
+    # Miscellaneous
+    parser.add_argument('--checkpoint', default=50000, type=int, help="Save plots and rets every checkpoint")
+    parser.add_argument('--results_dir', default="./results", type=str, help="Location to store results")
+    parser.add_argument('--device', default="cpu", type=str)    
+    parser.add_argument('--save_model', action='store_true', default=False)
+    parser.add_argument('--n_eval', default=0, type=int, help="Number of eval episodes")
+    parser.add_argument('--num_envs', default=5, type=int, help="Number of environments")
+    parser.add_argument('--episode_length', default=1000, type=int, help="Episode horizon")
+    parser.add_argument('--wandb', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--warm_start_critic', default=5000, type=int, help="Env steps before the actor updates")
+    parser.add_argument('--model_dir', default="./models", type=str, help="Location to store models")
+    args = parser.parse_args()
 
-
-def train(args, env, restore_path:str|None=None, log_fn=None):
-    """log_fn(steps_done, episode_return) is called at the end of every episode."""
-    tic = time.time()
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S") + f"-{args.algo}-{args.env}_seed-{args.seed}"
-    
-    # Env
-    env = SqueezeVecEnv(env)
-    env = gym.wrappers.FlattenObservation(env)
-    env = NormalizeObservation(env)
-    env = ClipAction(env)
-
-    #### Reproducibility
-    env.reset(seed=args.seed)
-    env.action_space.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
-    ####
-
-    # Learner
-    args.obs_dim =  env.observation_space.shape[0]
-    args.action_dim = env.action_space.shape[0]
-    agent = AVG(args)
-
-    if restore_path is not None:
-        from sim2sim.playground.param_transfer import convert
-        actor_sd, critic_sd, obs_rms = convert(
-            restore_path,
-            q_head=0)
-        if args.transfer_actor:
-            agent.actor.load_state_dict(actor_sd, strict=True)
-        if args.transfer_critic:
-            agent.Q.load_state_dict(critic_sd, strict=True)
-        if args.transfer_obs_rms:
-        # load the Sim1 normalizer stats from sim1 into sim2 env's NormalizeObservation.
-            rms = env.get_wrapper_attr("obs_rms")
-            assert obs_rms["mean"].shape == rms.mean.shape, (obs_rms["mean"].shape, rms.mean.shape)
-            rms.mean, rms.var, rms.count = obs_rms["mean"].copy(), obs_rms["var"].copy(), obs_rms["count"]
-
-    # Interaction     
-    rets, ep_steps = [], []
-    # wandb logging
-    ret, step, ploss, qloss = 0, 0, 0, 0
-    terminated, truncated = False, False
-    obs, _ = env.reset()
-    ep_tic = time.time()    
-    try:
-        for t in range(args.N):
-            # N.B: Action is a torch.Tensor
-            action, action_info = agent.compute_action(obs)                
-            sim_action = action.detach().cpu().view(-1).numpy()
-
-            # Receive reward and next state
-            next_obs, reward, terminated, truncated, _ = env.step(sim_action)
-            step += 1
-            p_loss, q_loss = agent.update(obs, action, next_obs, reward, terminated, **action_info, step=step)            
-            ret += reward
-            ploss += p_loss
-            qloss+= q_loss
-
-
-            obs = next_obs
-
-            if t % args.checkpoint == 0 and args.save_model:
-                agent.save(model_dir=args.results_dir, unique_str=f"{run_id}_model_{human_format_numbers(t)}")
-
-            # Termination
-            if terminated or truncated:
-                rets.append(ret)
-                ep_steps.append(step)
-                print("E: {}| D: {:.3f}| S: {}| R: {:.2f}| T: {}".format(len(rets), time.time() - ep_tic, step, ret, t))
-                if log_fn is not None:
-                    log_fn(t + 1, ret, ploss/step, qloss/step)
-
-                ep_tic = time.time()
-                obs, _ = env.reset()
-                ret, step, ploss, qloss = 0, 0, 0, 0
-    except Exception as e:
-        print(e)
-        print("Exiting this run, storing partial logs in the database for future debugging...")
-        traceback.print_exc()
-        raise  # N.B: otherwise a crashed AVG run looks finished and exper moves on to the next stage
-
-    if not (terminated or truncated):
-        # N.B: We're adding a partial episode just to make plotting easier. But this data point shouldn't be used
-        print("Appending partial episode #{}, length: {}, Total Steps: {}".format(len(rets), step, t+1))
-        rets.append(ret)
-        ep_steps.append(step)
-    
-    # Save returns and args before exiting run
+    # create env
+    env = wrap(envs.create(env_name=args.env), episode_length=args.episode_length)
+    # create agent
+    agent = AVG(args, env)
+    # train agent
+    agent = train(args, agent, env)
+    # save agent
     if args.save_model:
-        agent.save(model_dir=args.results_dir, unique_str=f"{run_id}_model")
-
-    print("Run with id: {} took {:.3f}s!".format(run_id, time.time()-tic))
-    
-    # Eval
-    if args.n_eval:
-        record_video(env, agent, num_episodes=args.n_eval, video_filename=f"{args.results_dir}/{run_id}.avi")
-
-    return ep_steps, rets, ploss, qloss
-
-
+        path = Path(args.model_dir)
+        if not path.exists():
+            path.mkdir(parents=True, exist_ok=True)
+        
+        save_avg_checkpoint(path, agent)
