@@ -38,9 +38,11 @@ def AVG(cfg, env):
     dtype = jnp.float32
     scaler = init_td_error_scaler()
     scaler = jax.tree.map(lambda x: jnp.broadcast_to(x, (num_envs,) + x.shape), scaler)
+    _,actor = init_actor(actor_key, cfg.actor_lr, obs_dim, net_params, action_dim, layer_norm, dtype)
+    _,critic = init_Q(critic_key, cfg.critic_lr, obs_dim, net_params, action_dim, layer_norm, dtype)
     return AVGState(
-        actor=init_actor(actor_key, cfg.actor_lr, obs_dim, net_params, action_dim, layer_norm, dtype),
-        critic=init_Q(critic_key, cfg.critic_lr, obs_dim, net_params, action_dim, layer_norm, dtype),
+        actor=actor,
+        critic=critic,
         td_error_scaler=scaler,
         normalizer=init_obs_normalizer(obs_dim),
         rng=rng,
@@ -70,6 +72,7 @@ def make_step(env, alpha, gamma, warm_start):
         action, lprob = jax.vmap(sample_action, in_axes=(None, None, 0, 0))(
             agent.actor, agent.actor.params, keys, obs_n)
         env_state = env.step(env_state, action)
+        # normalize next obs
         next_n = running_statistics.normalize(env_state.obs, normalizer)
         batch = Transition(
             obs=obs_n,
@@ -81,23 +84,28 @@ def make_step(env, alpha, gamma, warm_start):
             sample_key=keys,
         )
 
-        scaler, qloss_fn = critic_update(
+        _, scaler, qloss_fn = critic_update(
             upd_key, agent.actor, agent.critic, 1.0, batch, gamma, agent.td_error_scaler, alpha)
         qloss, qgrads = jax.value_and_grad(qloss_fn)(agent.critic.params)
         rng, agrads, ploss = actor_update(rng, agent.critic, batch, agent.actor, alpha)
+        # update critic
         critic = agent.critic.apply_gradients(grads=qgrads)
+        # update actor conditions on warm start critic
         actor = jax.lax.cond(
             agent.steps >= warm_start,
             lambda a: a.apply_gradients(grads=agrads),
             lambda a: a,
             agent.actor,
         )
+        # set ploss to 0 if not warm started
         ploss = jnp.where(agent.steps >= warm_start, ploss, 0.0)
-
+        # update episode return
         ep_ret = ep_ret + env_state.reward
+        # set episode return to 0 if episode is done
         finished_ret = ep_ret
         ep_ret = jnp.where(env_state.done, jnp.zeros_like(ep_ret), ep_ret)
-
+        
+        # update agent
         agent = agent.replace(
             actor=actor,
             critic=critic,
@@ -142,7 +150,7 @@ if __name__ == "__main__":
     parser.add_argument('--env', default="walker2d", type=str, help="e.g., 'walker2d' check brax documentation")
     parser.add_argument('--seed', default=42, type=int, help="Seed for random number generator")       
     parser.add_argument('--N', default=10001000, type=int, help="# timesteps for the run")
-    # SAVG params
+    # AVG params
     parser.add_argument('--actor_lr', default=0.0063, type=float, help="Actor step size")
     parser.add_argument('--critic_lr', default=0.0087, type=float, help="Critic step size")
     parser.add_argument('--beta1', default=0., type=float, help="Beta1 parameter of Adam optimizer")
@@ -157,7 +165,6 @@ if __name__ == "__main__":
     parser.add_argument('--results_dir', default="./results", type=str, help="Location to store results")
     parser.add_argument('--device', default="cpu", type=str)    
     parser.add_argument('--save_model', action='store_true', default=False)
-    parser.add_argument('--n_eval', default=0, type=int, help="Number of eval episodes")
     parser.add_argument('--num_envs', default=5, type=int, help="Number of environments")
     parser.add_argument('--episode_length', default=1000, type=int, help="Episode horizon")
     parser.add_argument('--wandb', action=argparse.BooleanOptionalAction, default=True)

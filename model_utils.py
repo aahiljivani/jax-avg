@@ -118,6 +118,6 @@ def actor_update(rng,
         action, lprob = jax.vmap(one)(transition.sample_key, transition.obs)
         q = critic.apply_fn({'params': critic.params}, key_q, transition.obs, action)
         return jnp.mean(alpha * lprob - q)
-    grads = jax.grad(loss)(actor.params)
-    return rng, grads
+    ploss, agrads = jax.value_and_grad(loss)(actor.params)
+    return rng, agrads, ploss
 

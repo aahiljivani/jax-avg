@@ -27,7 +27,6 @@ def wandb_run(args):
 
 def log_fn(metrics, run):
     ''' log metrics to wandb '''
-
     run.log({
         "Timesteps": metrics["timesteps"],
         "Episode_Returns": metrics["episode_return"],
