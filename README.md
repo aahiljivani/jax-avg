@@ -25,7 +25,7 @@ python train.py
 By default this trains on Brax `walker2d` for 1M+ timesteps. Common flags:
 
 ```bash
-python train.py --env walker2d --N 10001000 --seed 42 --num_envs 5
+python train.py --env walker2d --N 10001000 --seed 42 --num_envs 1000
 ```
 
 
